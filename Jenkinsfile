@@ -28,13 +28,13 @@ pipeline {
         stage('装依赖')
         {
             steps {
-                sh 'npm install'
+                sh 'pnpm install'
             }
         }
         
         stage('代码测试'){
             steps {
-                sh 'npm test'
+                sh 'pnpm test'
             }
         }
         
