@@ -16,4 +16,4 @@ COPY patches ./patches
 COPY scripts ./scripts
 
 EXPOSE 3000
-CMD ["pnpm", "dsh", "web"]
+CMD ["pnpm", "--offline", "dsh", "web"]
