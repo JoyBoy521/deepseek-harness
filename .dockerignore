@@ -1,6 +1,49 @@
+# 排除完整的 node_modules（我们只要 node_modules_prod）
 node_modules
+
 .git
+.github
+.vscode
+.idea
+
+# 文档
+*.md
+docs/
+website/
+
+# 测试
+__tests__
+*.test.ts
+*.test.js
+*.spec.ts
+*.spec.js
+benchmarks/
+snapshots/
+
+# 构建产物
 .next
 dist
 build
+coverage
+.turbo
+
+# 配置文件
+.env*
+!.env.example
+
+# 日志
 *.log
+logs/
+
+# Python 相关（如果不需要）
+*.pyc
+__pycache__/
+pytest.ini
+python/
+
+# 其他
+vendor/
+native/
+lefthook.yml
+vitest*.config.ts
+tsdown.config.ts
