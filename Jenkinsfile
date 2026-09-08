@@ -27,15 +27,15 @@ pipeline {
                 sh '''
                 pnpm config set registry https://registry.npmmirror.com
                 
-                # 装全部依赖（给后续可能的构建步骤用）
+                # 装全部依赖
                 pnpm install --frozen-lockfile
                 
-                # 单独装一份只有生产依赖的
+                # 装生产依赖（跳过 postinstall）
                 rm -rf node_modules_prod
-                NODE_ENV=production pnpm install --prod --frozen-lockfile
+                NODE_ENV=production pnpm install --prod --frozen-lockfile --ignore-scripts
                 cp -r node_modules node_modules_prod
                 
-                # 恢复完整依赖（防止后续步骤需要）
+                # 恢复完整依赖
                 pnpm install --frozen-lockfile
                 '''
             }
@@ -43,7 +43,6 @@ pipeline {
         
         stage('打包镜像') {
             steps {
-                // 构建前删旧镜像（只保留最近2个）
                 sh '''
                 docker images ${IMAGE_NAME} --format "{{.Tag}}" | sort -rn | tail -n +3 | xargs -I {} docker rmi ${IMAGE_NAME}:{} || true
                 '''
@@ -68,10 +67,7 @@ pipeline {
             }
             steps {
                 sh '''
-                # 清理悬空镜像
                 docker image prune -f
-                
-                # 清理 Jenkins 工作区的临时依赖目录
                 rm -rf node_modules_prod
                 '''
             }
