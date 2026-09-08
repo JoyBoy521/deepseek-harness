@@ -34,7 +34,7 @@ pipeline {
         
         stage('运行'){
             steps {
-                sh "pnpm dev"
+                sh "pnpm dsh web"
             }
         }
         
