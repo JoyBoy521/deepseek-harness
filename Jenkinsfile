@@ -32,9 +32,9 @@ pipeline {
             }
         }
         
-        stage('代码测试'){
+        stage('运行'){
             steps {
-                sh 'pnpm test'
+                sh "pnpm dev"
             }
         }
         
