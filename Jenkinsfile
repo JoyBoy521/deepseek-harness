@@ -26,16 +26,6 @@ pipeline {
             steps {
                 sh '''
                 pnpm config set registry https://registry.npmmirror.com
-                
-                # 装全部依赖
-                pnpm install --frozen-lockfile
-                
-                # 装生产依赖（跳过 postinstall）
-                rm -rf node_modules_prod
-                NODE_ENV=production pnpm install --prod --frozen-lockfile --ignore-scripts
-                cp -r node_modules node_modules_prod
-                
-                # 恢复完整依赖
                 pnpm install --frozen-lockfile
                 '''
             }
@@ -44,11 +34,11 @@ pipeline {
         stage('打包镜像') {
             steps {
                 sh '''
-                docker images ${IMAGE_NAME} --format "{{.Tag}}" | sort -rn | tail -n +3 | xargs -I {} docker rmi ${IMAGE_NAME}:{} || true
+                docker images ${IMAGE_NAME} --format "{{.Tag}}" | sort -rn | tail -n +2 | xargs -I {} docker rmi ${IMAGE_NAME}:{} || true
                 '''
                 
                 timeout(time: 10, unit: 'MINUTES') {
-                    sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ."
+                    sh "docker build --no-cache -t ${IMAGE_NAME}:${IMAGE_TAG} ."
                 }
             }
         }
@@ -67,8 +57,9 @@ pipeline {
             }
             steps {
                 sh '''
+                # 清理悬空镜像和构建缓存
                 docker image prune -f
-                rm -rf node_modules_prod
+                docker builder prune -f
                 '''
             }
         }
@@ -77,5 +68,9 @@ pipeline {
     post {
         success { echo "✅ 部署成功: http://192.168.187.128:8082" }
         failure { echo "❌ 构建失败" }
+        always {
+            // 无论成败都清理工作区的大文件
+            sh 'rm -rf node_modules_prod || true'
+        }
     }
 }
