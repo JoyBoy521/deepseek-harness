@@ -49,9 +49,10 @@ pipeline {
                 // 启动新容器
                 sh "docker run -d --name ${IMAGE_NAME} --restart unless-stopped -p 8082:8082 \
                     -v dsh-data:/root/.dsh \
-                    -e DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}\
+                    -e DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY} \
                     -e DEEPSEEK_BASE_URL=https://api.deepseek.com \
-                    ${IMAGE_NAME}:${IMAGE_TAG}" 
+                    ${IMAGE_NAME}:${IMAGE_TAG}"
+            }
         }
         
         stage('清理旧镜像') {
@@ -71,22 +72,22 @@ pipeline {
     }
 
     post {
-    success {
-        sh '''
-        # 等待 3 秒确保应用初始化并打印日志
-        sleep 3
-        TOKEN=$(docker logs deepseek-harness 2>/dev/null | grep -o 'token=[A-Za-z0-9_-]*' | tail -1 | sed 's/token=//')
-
-        if [ -z "$TOKEN" ]; then
+        success {
+            sh '''
+            # 等待 3 秒确保应用初始化并打印日志
             sleep 3
             TOKEN=$(docker logs deepseek-harness 2>/dev/null | grep -o 'token=[A-Za-z0-9_-]*' | tail -1 | sed 's/token=//')
-        fi
 
-        echo "✅ 部署成功: http://192.168.187.128:8082/?token=${TOKEN:-'<未获取到，请手动执行 docker logs>'}"
-        '''
-            }
-    failure { echo "❌ 构建失败" }
-        }   
+            if [ -z "$TOKEN" ]; then
+                sleep 3
+                TOKEN=$(docker logs deepseek-harness 2>/dev/null | grep -o 'token=[A-Za-z0-9_-]*' | tail -1 | sed 's/token=//')
+            fi
 
+            echo "✅ 部署成功: http://192.168.187.128:8082/?token=${TOKEN:-'<未获取到，请手动执行 docker logs>'}"
+            '''
+        }
+        failure { 
+            echo "❌ 构建失败" 
+        }
     }
 }
