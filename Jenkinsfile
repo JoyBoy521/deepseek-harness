@@ -9,6 +9,7 @@ pipeline {
     environment {
         IMAGE_NAME = "deepseek-harness"
         IMAGE_TAG  = "${env.BUILD_NUMBER}"
+        DEEPSEEK_API_KEY = credentials('deepseek-api-key')
     }
 
     stages {
@@ -46,8 +47,11 @@ pipeline {
                 sh "docker stop ${IMAGE_NAME} || true"
                 sh "docker rm ${IMAGE_NAME} || true"
                 // 启动新容器
-                sh "docker run -d --name ${IMAGE_NAME} --restart unless-stopped -p 8082:8082 -v dsh-data:/root/.dsh ${IMAGE_NAME}:${IMAGE_TAG}"
-            }
+                sh "docker run -d --name ${IMAGE_NAME} --restart unless-stopped -p 8082:8082 \
+                    -v dsh-data:/root/.dsh \
+                    -e DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}\
+                    -e DEEPSEEK_BASE_URL=https://api.deepseek.com \
+                    ${IMAGE_NAME}:${IMAGE_TAG}" 
         }
         
         stage('清理旧镜像') {
