@@ -88,4 +88,5 @@ pipeline {
     failure { echo "❌ 构建失败" }
         }   
 
+    }
 }
