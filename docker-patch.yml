@@ -1,0 +1,5 @@
+# 覆盖 webserver 配置：允许绑 0.0.0.0，容器外才能通过 -p 访问
+- id: webserver
+  config:
+    host: '0.0.0.0'
+    port: 3080
