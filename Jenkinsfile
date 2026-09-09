@@ -80,6 +80,8 @@ pipeline {
 
         echo "✅ 部署成功: http://192.168.187.128:8082/?token=${TOKEN:-'<未获取到，请手动执行 docker logs>'}"
         '''
-    }
+            }
     failure { echo "❌ 构建失败" }
+        }   
+
 }
