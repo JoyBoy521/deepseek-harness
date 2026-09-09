@@ -37,9 +37,8 @@ pipeline {
                 docker images ${IMAGE_NAME} --format "{{.Tag}}" | sort -rn | tail -n +2 | xargs -I {} docker rmi ${IMAGE_NAME}:{} || true
                 '''
                 
-                timeout(time: 10, unit: 'MINUTES') {
-                    sh "docker build --no-cache -t ${IMAGE_NAME}:${IMAGE_TAG} ."
-                }
+                sh "docker build --no-cache -t ${IMAGE_NAME}:${IMAGE_TAG} ."
+
             }
         }
         
@@ -47,7 +46,7 @@ pipeline {
             steps {
                 sh "docker stop ${IMAGE_NAME} || true"
                 sh "docker rm ${IMAGE_NAME} || true"
-                sh "docker run -d --name ${IMAGE_NAME} -p 8082:3080 ${IMAGE_NAME}:${IMAGE_TAG}"
+                sh "docker run -d --name ${IMAGE_NAME} --restart unless-stopped -p 8082:8082 -v dsh-data:/root/.dsh ${IMAGE_NAME}:${IMAGE_TAG}"
             }
         }
         
