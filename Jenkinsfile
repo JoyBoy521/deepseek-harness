@@ -59,7 +59,11 @@ pipeline {
 
         stage('记录版本') {
             steps {
-                sh "mkdir -p /releases && echo ${TAG} > /releases/current.txt"
+                sh '''
+                mkdir -p "$JENKINS_HOME/releases"
+                echo "$TAG" > "$JENKINS_HOME/releases/current.txt"
+                echo "当前部署版本: $(cat "$JENKINS_HOME/releases/current.txt")"
+                '''
             }
         }
 
