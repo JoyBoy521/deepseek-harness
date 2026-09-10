@@ -35,6 +35,7 @@ pipeline {
                 sh """
                 echo "${HARBOR_PASS}" | docker login ${REGISTRY} -u "${HARBOR_USER}" --password-stdin
                 docker push ${IMAGE}:${TAG}
+                docker logout "$REGISTRY" 
                 echo "已推送: ${IMAGE}:${TAG}"
                 """
             }
