@@ -138,11 +138,19 @@ pipeline {
     post {
         success {
             sh '''
-            TOKEN=$(docker logs "$CONTAINER" 2>/dev/null | grep -o 'token=[A-Za-z0-9_-]*' | tail -1 | sed 's/token=//')
+            for i in $(seq 1 30); do
+              TOKEN=$(docker logs "$CONTAINER" 2>/dev/null | grep -o 'token=[A-Za-z0-9_-]*' | tail -1 | sed 's/token=//')
+              if [ -n "$TOKEN" ]; then break; fi
+              sleep 5
+            done
             echo "✅ CI 完成"
             echo "镜像已入库: $IMAGE:$TAG"
             echo "源码: $GIT_REF @ $GIT_SHA"
-            echo "dev 访问: http://192.168.187.128:8082/?token=$TOKEN"
+            if [ -n "$TOKEN" ]; then
+              echo "dev 访问: http://192.168.187.128:8082/?token=$TOKEN"
+            else
+              echo "⚠️ 暂未取到 token，稍后手动执行: docker logs $CONTAINER | grep token"
+            fi
             '''
         }
         failure {
