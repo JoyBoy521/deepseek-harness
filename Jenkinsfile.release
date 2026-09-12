@@ -30,8 +30,14 @@ pipeline {
                         if (!f.exists()) {
                             return ["<还没有任何构建版本，请先跑 CI 线>"]
                         }
-                        def tags = f.readLines().collect { it.trim() }.findAll { it }
-                        return tags.reverse().take(20) ?: ["<版本清单为空>"]
+                        def lines = f.readLines()
+                        def out = new java.util.ArrayList()
+                        for (int i = lines.size() - 1; i >= 0; i--) {
+                            def s = lines.get(i).trim()
+                            if (s.length() > 0) { out.add(s) }
+                            if (out.size() >= 20) { break }
+                        }
+                        return out.size() > 0 ? out : ["<版本清单为空>"]
                     '''
                 ]
             ]
