@@ -151,12 +151,17 @@ pipeline {
         }
 
         stage('清理本地旧镜像') {
-            when { expression { params.CLEAN_IMAGES == true } }
             steps {
                 sh '''
-                # 按创建时间倒序，只留最近 5 个（完整版本都在 Harbor 里）
-                docker images "$IMAGE" --format "{{.CreatedAt}}\t{{.Tag}}" | sort -r | tail -n +6 \
+                # 本地只保留最近 2 个版本（完整版本都在 Harbor 里，随时能拉回来）
+                # 每个镜像约 5GB，留太多会把磁盘撑爆
+                docker images "$IMAGE" --format "{{.CreatedAt}}\t{{.Tag}}" | sort -r | tail -n +3 \
                   | awk '{print $NF}' | xargs -I {} docker rmi "$IMAGE:{}" || true
+                # 悬空镜像（构建中间层）按需清理
+                if [ "$CLEAN_IMAGES" = "true" ]; then
+                  docker image prune -f
+                fi
+                df -h / | tail -1
                 '''
             }
         }
