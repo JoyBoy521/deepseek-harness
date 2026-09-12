@@ -8,39 +8,30 @@ pipeline {
     }
 
     parameters {
-        // 版本列表在参数页直接从 Harbor 拉取（需要 Active Choices 插件）
-        // 首次使用会被 Groovy 沙箱拦截 → 系统管理 → In-process Script Approval → 批准
+        // 版本清单由 CI 线产出（写入 $JENKINS_HOME/releases/tags.txt），这里只负责读取。
+        // 脚本在 Jenkins 控制器（容器）里执行，所以用容器内路径。
+        // 首次使用可能需要：系统管理 → In-process Script Approval → 批准
         activeChoice(
             name: 'IMAGE_TAG',
             choiceType: 'PT_SINGLE_SELECT',
-            description: '选择要发布的镜像版本（列表来自 Harbor，最新在最上面）',
+            description: '选择要发布的版本（清单由 CI 构建产出，最新的在最上面）',
             script: [
                 $class: 'GroovyScript',
                 fallbackScript: [
                     classpath: [],
                     sandbox: true,
-                    script: 'return ["<取版本列表失败：检查 Harbor 是否可访问，或手动填写 tag>"]'
+                    script: 'return ["<读不到版本清单，请先跑一次 CI 线>"]'
                 ],
                 script: [
                     classpath: [],
                     sandbox: true,
                     script: '''
-                        def tags = []
-                        try {
-                            def creds = com.cloudbees.plugins.credentials.SystemCredentialsProvider.getInstance()
-                                            .getCredentials().find { it.id == "harbor-cred" }
-                            def auth = "Basic " + (creds.username + ":" + creds.password).bytes.encodeBase64().toString()
-                            def url = "http://192.168.187.128:8088/api/v2.0/projects/joyboy/repositories/deepseek-harness/artifacts?page_size=50&sort=-push_time"
-                            def conn = new URL(url).openConnection()
-                            conn.setRequestProperty("Authorization", auth)
-                            conn.setConnectTimeout(3000)
-                            conn.setReadTimeout(5000)
-                            def data = new groovy.json.JsonSlurper().parse(conn.inputStream.getText("UTF-8"))
-                            tags = data.collect { it.tags ? it.tags.collect { t -> t.name } : [] }.flatten().findAll { it }
-                        } catch (e) {
-                            return ["<取版本列表失败: " + e.message + ">"]
+                        def f = new File("/var/jenkins_home/releases/tags.txt")
+                        if (!f.exists()) {
+                            return ["<还没有任何构建版本，请先跑 CI 线>"]
                         }
-                        return tags ?: ["<Harbor 里还没有任何版本>"]
+                        def tags = f.readLines().collect { it.trim() }.findAll { it }
+                        return tags.reverse().take(20) ?: ["<版本清单为空>"]
                     '''
                 ]
             ]
