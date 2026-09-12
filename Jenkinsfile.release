@@ -1,8 +1,15 @@
 pipeline {
     agent any
 
+    options {
+        // 发布是有风险的动作：同一时间只允许一个，避免互相回滚/覆盖
+        disableConcurrentBuilds()
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '50'))
+    }
+
     parameters {
-        string(name: 'IMAGE_TAG', defaultValue: '', description: '要发布的镜像版本（Harbor 里的 tag，如 20260910u48）')
+        string(name: 'IMAGE_TAG', defaultValue: '', description: '要发布的镜像版本（Harbor 里的 tag，如 20260911u3-a620675bfc）')
         choice(name: 'TARGET_ENV', choices: ['staging', 'prod'], description: '发布到哪个环境')
     }
 
@@ -20,11 +27,12 @@ pipeline {
             steps {
                 script {
                     if (!params.IMAGE_TAG?.trim()) {
-                        error('❌ 必须填写 IMAGE_TAG（要发布哪个镜像版本）')
+                        error('❌ 必须填写 IMAGE_TAG（要发布哪个镜像版本，见 Harbor 项目 joyboy 的 tag 列表）')
                     }
                     env.CONTAINER = "deepseek-harness-${params.TARGET_ENV}"
                     env.PORT = (params.TARGET_ENV == 'prod') ? '8084' : '8083'
-                    echo "环境 = ${params.TARGET_ENV}，容器 = ${env.CONTAINER}，端口 = ${env.PORT}，版本 = ${params.IMAGE_TAG}"
+                    env.APP_ENV = params.TARGET_ENV
+                    echo "环境 = ${env.APP_ENV}，容器 = ${env.CONTAINER}，端口 = ${env.PORT}，版本 = ${params.IMAGE_TAG}"
                 }
             }
         }
@@ -61,7 +69,7 @@ pipeline {
                   -v "dsh-data-${TARGET_ENV}:/root/.dsh" \
                   -e DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
                   -e DEEPSEEK_BASE_URL="https://api.deepseek.com" \
-                  -e APP_ENV="$TARGET_ENV" \
+                  -e APP_ENV="$APP_ENV" \
                   "$IMAGE:$IMAGE_TAG"
                 '''
             }
@@ -70,13 +78,15 @@ pipeline {
         stage('健康检查') {
             steps {
                 sh '''
-                for i in $(seq 1 30); do
-                  if docker exec "$CONTAINER" node -e "fetch('http://127.0.0.1:8082').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
+                # 严格健康检查：5xx（后端没起来）不算通过
+                for i in $(seq 1 40); do
+                  if docker exec "$CONTAINER" node -e "fetch('http://127.0.0.1:8082').then(r=>process.exit(r.status>=500?1:0)).catch(()=>process.exit(1))" 2>/dev/null; then
                     echo "✅ $TARGET_ENV 健康检查通过"; exit 0
                   fi
+                  echo "第 $i 次检查未就绪，5 秒后重试…"
                   sleep 5
                 done
-                echo "❌ 健康检查失败"; docker logs "$CONTAINER" --tail 30; exit 1
+                echo "❌ 健康检查失败"; docker logs "$CONTAINER" --tail 40; exit 1
                 '''
             }
         }
@@ -87,8 +97,8 @@ pipeline {
                 printf "%s | RELEASE | %s | %s | build#%s\\n" \
                   "$(date '+%F %T')" "$TARGET_ENV" "$IMAGE_TAG" "$BUILD_NUMBER" \
                   >> "$JENKINS_HOME/releases/deployments.log"
+                echo "---- 最近 10 条发布记录 ----"
                 tail -10 "$JENKINS_HOME/releases/deployments.log"
-                docker logout "$REGISTRY"
                 '''
             }
         }
@@ -97,29 +107,56 @@ pipeline {
     post {
         success {
             sh '''
-            TOKEN=$(docker logs "$CONTAINER" 2>/dev/null | grep -o 'token=[A-Za-z0-9_-]*' | tail -1 | sed 's/token=//')
+            # 等 dsh 打印 token（最多 150 秒）
+            for i in $(seq 1 30); do
+              TOKEN=$(docker logs "$CONTAINER" 2>/dev/null | grep -o 'token=[A-Za-z0-9_-]*' | tail -1 | sed 's/token=//')
+              if [ -n "$TOKEN" ]; then break; fi
+              sleep 5
+            done
             echo "✅ 发布成功: $TARGET_ENV <- $IMAGE_TAG"
-            echo "访问: http://192.168.187.128:${PORT}/?token=$TOKEN"
+            if [ -n "$TOKEN" ]; then
+              echo "访问: http://192.168.187.128:${PORT}/?token=$TOKEN"
+            else
+              echo "⚠️ 暂未取到 token，稍后手动执行: docker logs $CONTAINER | grep token"
+            fi
             '''
         }
         failure {
             sh '''
-            echo "❌ 发布失败，尝试自动回滚…"
+            echo "❌ 发布失败，开始自动回滚…"
             PREV=$(cat "$JENKINS_HOME/releases/last_good_${TARGET_ENV}.txt" 2>/dev/null)
-            if [ -n "$PREV" ] && [ "$PREV" != "none" ]; then
-              echo "$HARBOR_PASS" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin >/dev/null 2>&1 || true
-              docker pull "$IMAGE:$PREV" || true
-              docker stop "$CONTAINER" || true; docker rm "$CONTAINER" || true
-              docker run -d --name "$CONTAINER" --restart unless-stopped -p "${PORT}:8082" \
-                -v "dsh-data-${TARGET_ENV}:/root/.dsh" \
-                -e DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
-                -e DEEPSEEK_BASE_URL="https://api.deepseek.com" \
-                "$IMAGE:$PREV"
-              echo "✅ 已自动回滚到 $PREV"
-            else
-              echo "⚠️ 没有可用的回滚点，请人工处理"
+            if [ -z "$PREV" ] || [ "$PREV" = "none" ]; then
+              echo "⚠️ 没有可用的回滚点，请人工处理（容器当前状态见下）"
+              docker ps -a --filter "name=$CONTAINER"
+              exit 0
             fi
+
+            echo "回滚目标版本: $PREV"
+            echo "$HARBOR_PASS" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin >/dev/null 2>&1 || true
+            docker pull "$IMAGE:$PREV" || true
+            docker stop "$CONTAINER" || true
+            docker rm "$CONTAINER" || true
+            docker run -d --name "$CONTAINER" --restart unless-stopped -p "${PORT}:8082" \
+              -v "dsh-data-${TARGET_ENV}:/root/.dsh" \
+              -e DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
+              -e DEEPSEEK_BASE_URL="https://api.deepseek.com" \
+              -e APP_ENV="$APP_ENV" \
+              "$IMAGE:$PREV"
+
+            echo "等待回滚后的容器就绪…"
+            for i in $(seq 1 30); do
+              if docker exec "$CONTAINER" node -e "fetch('http://127.0.0.1:8082').then(r=>process.exit(r.status>=500?1:0)).catch(()=>process.exit(1))" 2>/dev/null; then
+                echo "✅ 已自动回滚到 $PREV，服务已恢复"
+                exit 0
+              fi
+              sleep 5
+            done
+            echo "❌ 回滚后仍未就绪，请人工介入"; docker logs "$CONTAINER" --tail 40
             '''
+        }
+        always {
+            // 无论成败都清掉 Harbor 凭据
+            sh 'docker logout "$REGISTRY" || true'
         }
     }
 }
