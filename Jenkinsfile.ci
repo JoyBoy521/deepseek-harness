@@ -2,11 +2,8 @@ pipeline {
     agent any
 
     options {
-        // 同一时间只允许一个构建：避免两次构建抢同一个容器名
         disableConcurrentBuilds()
-        // 整条流水线最长 90 分钟，防止卡死（镜像构建慢，留足余量）
         timeout(time: 90, unit: 'MINUTES')
-        // Jenkins 只保留最近 30 次构建记录，避免历史堆积
         buildDiscarder(logRotator(numToKeepStr: '30'))
     }
 
@@ -18,15 +15,12 @@ pipeline {
     }
 
     environment {
-        REGISTRY = "192.168.187.128:8088"
-        PROJECT  = "joyboy"
-        IMAGE    = "${REGISTRY}/${PROJECT}/deepseek-harness"
-        HARBOR_USER = credentials('harbor-user')
-        HARBOR_PASS = credentials('harbor-pass')
-        DEEPSEEK_API_KEY = credentials('deepseek-api-key')
-        APP_ENV = "dev"
+        REGISTRY  = "192.168.187.128:8088"
+        PROJECT   = "joyboy"
+        IMAGE     = "${REGISTRY}/${PROJECT}/deepseek-harness"
+        APP_ENV   = "dev"
         CONTAINER = "deepseek-harness-dev"
-        PORT = "8082"
+        PORT      = "8082"
     }
 
     stages {
@@ -36,7 +30,6 @@ pipeline {
             }
         }
 
-        // 必须先拉代码：后面的 git rev-parse 需要仓库
         stage('拉取项目') {
             steps {
                 script {
@@ -48,7 +41,6 @@ pipeline {
             }
         }
 
-        // 镜像标签 = 日期 + u + 构建号 + 提交短哈希（可从镜像追溯源码）
         stage('生成镜像标签') {
             steps {
                 script {
@@ -69,28 +61,34 @@ pipeline {
 
         stage('推送 Harbor') {
             steps {
-                sh '''
-                echo "$HARBOR_PASS" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin
-                docker push "$IMAGE:$TAG"
-                echo "已推送: $IMAGE:$TAG"
-                '''
+                withCredentials([usernamePassword(credentialsId: 'harbor-cred',
+                                                  usernameVariable: 'HARBOR_USER',
+                                                  passwordVariable: 'HARBOR_PASS')]) {
+                    sh '''
+                    echo "$HARBOR_PASS" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin
+                    docker push "$IMAGE:$TAG"
+                    echo "已推送: $IMAGE:$TAG"
+                    '''
+                }
             }
         }
 
         stage('部署到 dev') {
             when { expression { params.DEPLOY_DEV == true } }
             steps {
-                sh '''
-                docker pull "$IMAGE:$TAG"
-                docker stop "$CONTAINER" || true
-                docker rm "$CONTAINER" || true
-                docker run -d --name "$CONTAINER" --restart unless-stopped -p "${PORT}:8082" \
-                  -v "dsh-data-dev:/root/.dsh" \
-                  -e DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
-                  -e DEEPSEEK_BASE_URL="https://api.deepseek.com" \
-                  -e APP_ENV="$APP_ENV" \
-                  "$IMAGE:$TAG"
-                '''
+                withCredentials([string(credentialsId: 'deepseek-api-key', variable: 'API_KEY')]) {
+                    sh '''
+                    docker pull "$IMAGE:$TAG"
+                    docker stop "$CONTAINER" || true
+                    docker rm "$CONTAINER" || true
+                    docker run -d --name "$CONTAINER" --restart unless-stopped -p "${PORT}:8082" \
+                      -v "dsh-data-dev:/root/.dsh" \
+                      -e DEEPSEEK_API_KEY="$API_KEY" \
+                      -e DEEPSEEK_BASE_URL="https://api.deepseek.com" \
+                      -e APP_ENV="$APP_ENV" \
+                      "$IMAGE:$TAG"
+                    '''
+                }
             }
         }
 
@@ -98,13 +96,15 @@ pipeline {
             when { expression { params.DEPLOY_DEV == true } }
             steps {
                 sh '''
-                for i in $(seq 1 30); do
-                  if docker exec "$CONTAINER" node -e "fetch('http://127.0.0.1:8082').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
+                # 严格健康检查：HTTP 5xx（nginx 502 = 后端还没起来）不算通过
+                for i in $(seq 1 40); do
+                  if docker exec "$CONTAINER" node -e "fetch('http://127.0.0.1:8082').then(r=>process.exit(r.status>=500?1:0)).catch(()=>process.exit(1))" 2>/dev/null; then
                     echo "✅ dev 健康检查通过"; exit 0
                   fi
+                  echo "第 $i 次检查未就绪，5 秒后重试…"
                   sleep 5
                 done
-                echo "❌ dev 健康检查失败"; docker logs "$CONTAINER" --tail 30; exit 1
+                echo "❌ dev 健康检查失败"; docker logs "$CONTAINER" --tail 40; exit 1
                 '''
             }
         }
@@ -113,11 +113,14 @@ pipeline {
             steps {
                 sh '''
                 mkdir -p "$JENKINS_HOME/releases"
-                printf "%s | CI | %s | %s | %s | %s | %s\\n" \
+                printf "%s | CI | %s | %s | %s | %s | %s\n" \
                   "$(date '+%F %T')" "$APP_ENV" "$TAG" "$GIT_REF" "$GIT_SHA" "$BUILD_NUMBER" \
                   >> "$JENKINS_HOME/releases/builds.log"
+                echo "$TAG" >> "$JENKINS_HOME/releases/tags.txt"
                 echo "---- 最近 5 条构建记录 ----"
                 tail -5 "$JENKINS_HOME/releases/builds.log"
+                echo "---- 最近 5 个可用版本 ----"
+                tail -5 "$JENKINS_HOME/releases/tags.txt"
                 '''
             }
         }
@@ -127,7 +130,7 @@ pipeline {
             steps {
                 sh '''
                 docker image prune -f
-                # 本地只留最近 5 个版本（完整版本都在 Harbor 里，不心疼）
+                # 按创建时间倒序，只留最近 5 个（完整版本都在 Harbor 里）
                 docker images "$IMAGE" --format "{{.CreatedAt}}\t{{.Tag}}" | sort -r | tail -n +6 \
                   | awk '{print $NF}' | xargs -I {} docker rmi "$IMAGE:{}" || true
                 '''
@@ -157,7 +160,6 @@ pipeline {
             echo "❌ CI 失败（不影响线上，可重跑）"
         }
         always {
-            // 无论成败都清掉 Harbor 凭据，避免留在 Jenkins 容器里
             sh 'docker logout "$REGISTRY" || true'
         }
     }

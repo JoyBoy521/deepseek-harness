@@ -2,14 +2,49 @@ pipeline {
     agent any
 
     options {
-        // 发布是有风险的动作：同一时间只允许一个，避免互相回滚/覆盖
         disableConcurrentBuilds()
         timeout(time: 60, unit: 'MINUTES')
         buildDiscarder(logRotator(numToKeepStr: '50'))
     }
 
     parameters {
-        string(name: 'IMAGE_TAG', defaultValue: '', description: '要发布的镜像版本（Harbor 里的 tag，如 20260911u3-a620675bfc）')
+        // 版本列表在参数页直接从 Harbor 拉取（需要 Active Choices 插件）
+        // 首次使用会被 Groovy 沙箱拦截 → 系统管理 → In-process Script Approval → 批准
+        activeChoice(
+            name: 'IMAGE_TAG',
+            choiceType: 'PT_SINGLE_SELECT',
+            description: '选择要发布的镜像版本（列表来自 Harbor，最新在最上面）',
+            script: [
+                $class: 'GroovyScript',
+                fallbackScript: [
+                    classpath: [],
+                    sandbox: true,
+                    script: 'return ["<取版本列表失败：检查 Harbor 是否可访问，或手动填写 tag>"]'
+                ],
+                script: [
+                    classpath: [],
+                    sandbox: true,
+                    script: '''
+                        def tags = []
+                        try {
+                            def creds = com.cloudbees.plugins.credentials.SystemCredentialsProvider.getInstance()
+                                            .getCredentials().find { it.id == "harbor-cred" }
+                            def auth = "Basic " + (creds.username + ":" + creds.password).bytes.encodeBase64().toString()
+                            def url = "http://192.168.187.128:8088/api/v2.0/projects/joyboy/repositories/deepseek-harness/artifacts?page_size=50&sort=-push_time"
+                            def conn = new URL(url).openConnection()
+                            conn.setRequestProperty("Authorization", auth)
+                            conn.setConnectTimeout(3000)
+                            conn.setReadTimeout(5000)
+                            def data = new groovy.json.JsonSlurper().parse(conn.inputStream.getText("UTF-8"))
+                            tags = data.collect { it.tags ? it.tags.collect { t -> t.name } : [] }.flatten().findAll { it }
+                        } catch (e) {
+                            return ["<取版本列表失败: " + e.message + ">"]
+                        }
+                        return tags ?: ["<Harbor 里还没有任何版本>"]
+                    '''
+                ]
+            ]
+        )
         choice(name: 'TARGET_ENV', choices: ['staging', 'prod'], description: '发布到哪个环境')
     }
 
@@ -17,34 +52,37 @@ pipeline {
         REGISTRY = "192.168.187.128:8088"
         PROJECT  = "joyboy"
         IMAGE    = "${REGISTRY}/${PROJECT}/deepseek-harness"
-        HARBOR_USER = credentials('harbor-user')
-        HARBOR_PASS = credentials('harbor-pass')
-        DEEPSEEK_API_KEY = credentials('deepseek-api-key')
     }
 
     stages {
         stage('参数校验与环境推导') {
             steps {
                 script {
-                    if (!params.IMAGE_TAG?.trim()) {
-                        error('❌ 必须填写 IMAGE_TAG（要发布哪个镜像版本，见 Harbor 项目 joyboy 的 tag 列表）')
+                    if (!params.IMAGE_TAG?.trim() || params.IMAGE_TAG.startsWith('<')) {
+                        error('❌ 必须选择一个有效的 IMAGE_TAG！（看参数下拉列表，或确认 Harbor 里已有版本）')
                     }
-                    env.CONTAINER = "deepseek-harness-${params.TARGET_ENV}"
-                    env.PORT = (params.TARGET_ENV == 'prod') ? '8084' : '8083'
-                    env.APP_ENV = params.TARGET_ENV
-                    echo "环境 = ${env.APP_ENV}，容器 = ${env.CONTAINER}，端口 = ${env.PORT}，版本 = ${params.IMAGE_TAG}"
+                    env.TARGET_ENV = params.TARGET_ENV
+                    env.IMAGE_TAG  = params.IMAGE_TAG
+                    env.CONTAINER  = "deepseek-harness-${params.TARGET_ENV}"
+                    env.PORT       = (params.TARGET_ENV == 'prod') ? '8084' : '8083'
+                    env.APP_ENV    = params.TARGET_ENV
+                    echo "环境 = ${env.APP_ENV} | 容器 = ${env.CONTAINER} | 端口 = ${env.PORT} | 镜像版本 = ${env.IMAGE_TAG}"
                 }
             }
         }
 
         stage('校验镜像存在') {
             steps {
-                sh '''
-                echo "$HARBOR_PASS" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin
-                docker manifest inspect "$IMAGE:$IMAGE_TAG" >/dev/null 2>&1 \
-                  || { echo "❌ Harbor 里没有这个版本: $IMAGE:$IMAGE_TAG"; exit 1; }
-                echo "✅ 版本存在，可以发布"
-                '''
+                withCredentials([usernamePassword(credentialsId: 'harbor-cred',
+                                                  usernameVariable: 'HARBOR_USER',
+                                                  passwordVariable: 'HARBOR_PASS')]) {
+                    sh '''
+                    echo "$HARBOR_PASS" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin
+                    docker manifest inspect "$IMAGE:$IMAGE_TAG" >/dev/null 2>&1 \
+                      || { echo "❌ Harbor 里没有这个版本: $IMAGE:$IMAGE_TAG"; exit 1; }
+                    echo "✅ 版本存在，可以发布"
+                    '''
+                }
             }
         }
 
@@ -59,26 +97,27 @@ pipeline {
             }
         }
 
-        stage('发布') {
+        stage('执行部署') {
             steps {
-                sh '''
-                docker pull "$IMAGE:$IMAGE_TAG"
-                docker stop "$CONTAINER" || true
-                docker rm "$CONTAINER" || true
-                docker run -d --name "$CONTAINER" --restart unless-stopped -p "${PORT}:8082" \
-                  -v "dsh-data-${TARGET_ENV}:/root/.dsh" \
-                  -e DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
-                  -e DEEPSEEK_BASE_URL="https://api.deepseek.com" \
-                  -e APP_ENV="$APP_ENV" \
-                  "$IMAGE:$IMAGE_TAG"
-                '''
+                withCredentials([string(credentialsId: 'deepseek-api-key', variable: 'API_KEY')]) {
+                    sh '''
+                    docker pull "$IMAGE:$IMAGE_TAG"
+                    docker stop "$CONTAINER" || true
+                    docker rm "$CONTAINER" || true
+                    docker run -d --name "$CONTAINER" --restart unless-stopped -p "${PORT}:8082" \
+                      -v "dsh-data-${TARGET_ENV}:/root/.dsh" \
+                      -e DEEPSEEK_API_KEY="$API_KEY" \
+                      -e DEEPSEEK_BASE_URL="https://api.deepseek.com" \
+                      -e APP_ENV="$APP_ENV" \
+                      "$IMAGE:$IMAGE_TAG"
+                    '''
+                }
             }
         }
 
         stage('健康检查') {
             steps {
                 sh '''
-                # 严格健康检查：5xx（后端没起来）不算通过
                 for i in $(seq 1 40); do
                   if docker exec "$CONTAINER" node -e "fetch('http://127.0.0.1:8082').then(r=>process.exit(r.status>=500?1:0)).catch(()=>process.exit(1))" 2>/dev/null; then
                     echo "✅ $TARGET_ENV 健康检查通过"; exit 0
@@ -94,7 +133,7 @@ pipeline {
         stage('记录发布台账') {
             steps {
                 sh '''
-                printf "%s | RELEASE | %s | %s | build#%s\\n" \
+                printf "%s | RELEASE | %s | %s | build#%s\n" \
                   "$(date '+%F %T')" "$TARGET_ENV" "$IMAGE_TAG" "$BUILD_NUMBER" \
                   >> "$JENKINS_HOME/releases/deployments.log"
                 echo "---- 最近 10 条发布记录 ----"
@@ -107,7 +146,6 @@ pipeline {
     post {
         success {
             sh '''
-            # 等 dsh 打印 token（最多 150 秒）
             for i in $(seq 1 30); do
               TOKEN=$(docker logs "$CONTAINER" 2>/dev/null | grep -o 'token=[A-Za-z0-9_-]*' | tail -1 | sed 's/token=//')
               if [ -n "$TOKEN" ]; then break; fi
@@ -115,47 +153,51 @@ pipeline {
             done
             echo "✅ 发布成功: $TARGET_ENV <- $IMAGE_TAG"
             if [ -n "$TOKEN" ]; then
-              echo "访问: http://192.168.187.128:${PORT}/?token=$TOKEN"
+              echo "访问地址: http://192.168.187.128:${PORT}/?token=$TOKEN"
             else
               echo "⚠️ 暂未取到 token，稍后手动执行: docker logs $CONTAINER | grep token"
             fi
             '''
         }
         failure {
-            sh '''
-            echo "❌ 发布失败，开始自动回滚…"
-            PREV=$(cat "$JENKINS_HOME/releases/last_good_${TARGET_ENV}.txt" 2>/dev/null)
-            if [ -z "$PREV" ] || [ "$PREV" = "none" ]; then
-              echo "⚠️ 没有可用的回滚点，请人工处理（容器当前状态见下）"
-              docker ps -a --filter "name=$CONTAINER"
-              exit 0
-            fi
+            withCredentials([
+                usernamePassword(credentialsId: 'harbor-cred', usernameVariable: 'HARBOR_USER', passwordVariable: 'HARBOR_PASS'),
+                string(credentialsId: 'deepseek-api-key', variable: 'API_KEY')
+            ]) {
+                sh '''
+                echo "❌ 发布失败，开始自动回滚…"
+                PREV=$(cat "$JENKINS_HOME/releases/last_good_${TARGET_ENV}.txt" 2>/dev/null)
+                if [ -z "$PREV" ] || [ "$PREV" = "none" ]; then
+                  echo "⚠️ 没有可用的回滚点，请人工处理（当前容器状态）:"
+                  docker ps -a --filter "name=deepseek-harness"
+                  exit 0
+                fi
 
-            echo "回滚目标版本: $PREV"
-            echo "$HARBOR_PASS" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin >/dev/null 2>&1 || true
-            docker pull "$IMAGE:$PREV" || true
-            docker stop "$CONTAINER" || true
-            docker rm "$CONTAINER" || true
-            docker run -d --name "$CONTAINER" --restart unless-stopped -p "${PORT}:8082" \
-              -v "dsh-data-${TARGET_ENV}:/root/.dsh" \
-              -e DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
-              -e DEEPSEEK_BASE_URL="https://api.deepseek.com" \
-              -e APP_ENV="$APP_ENV" \
-              "$IMAGE:$PREV"
+                echo "回滚目标版本: $PREV"
+                echo "$HARBOR_PASS" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin >/dev/null 2>&1 || true
+                docker pull "$IMAGE:$PREV" || true
+                docker stop "$CONTAINER" || true
+                docker rm "$CONTAINER" || true
+                docker run -d --name "$CONTAINER" --restart unless-stopped -p "${PORT}:8082" \
+                  -v "dsh-data-${TARGET_ENV}:/root/.dsh" \
+                  -e DEEPSEEK_API_KEY="$API_KEY" \
+                  -e DEEPSEEK_BASE_URL="https://api.deepseek.com" \
+                  -e APP_ENV="$APP_ENV" \
+                  "$IMAGE:$PREV"
 
-            echo "等待回滚后的容器就绪…"
-            for i in $(seq 1 30); do
-              if docker exec "$CONTAINER" node -e "fetch('http://127.0.0.1:8082').then(r=>process.exit(r.status>=500?1:0)).catch(()=>process.exit(1))" 2>/dev/null; then
-                echo "✅ 已自动回滚到 $PREV，服务已恢复"
-                exit 0
-              fi
-              sleep 5
-            done
-            echo "❌ 回滚后仍未就绪，请人工介入"; docker logs "$CONTAINER" --tail 40
-            '''
+                echo "等待回滚后的容器就绪…"
+                for i in $(seq 1 30); do
+                  if docker exec "$CONTAINER" node -e "fetch('http://127.0.0.1:8082').then(r=>process.exit(r.status>=500?1:0)).catch(()=>process.exit(1))" 2>/dev/null; then
+                    echo "✅ 已自动回滚到 $PREV，服务已恢复"
+                    exit 0
+                  fi
+                  sleep 5
+                done
+                echo "❌ 回滚后仍未就绪，请人工介入"; docker logs "$CONTAINER" --tail 40
+                '''
+            }
         }
         always {
-            // 无论成败都清掉 Harbor 凭据
             sh 'docker logout "$REGISTRY" || true'
         }
     }
