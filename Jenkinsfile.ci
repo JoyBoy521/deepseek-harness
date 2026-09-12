@@ -116,11 +116,17 @@ pipeline {
                 printf "%s | CI | %s | %s | %s | %s | %s\n" \
                   "$(date '+%F %T')" "$APP_ENV" "$TAG" "$GIT_REF" "$GIT_SHA" "$BUILD_NUMBER" \
                   >> "$JENKINS_HOME/releases/builds.log"
-                echo "$TAG" >> "$JENKINS_HOME/releases/tags.txt"
+                # 版本清单：最新的写在最前面，最多保留 50 条
+                # （CD 参数页直接 readLines() 读取，所以这里必须保持"最新在前"的顺序）
+                {
+                  echo "$TAG"
+                  cat "$JENKINS_HOME/releases/tags.txt" 2>/dev/null
+                } | head -50 > "$JENKINS_HOME/releases/tags.txt.new" \
+                  && mv "$JENKINS_HOME/releases/tags.txt.new" "$JENKINS_HOME/releases/tags.txt"
                 echo "---- 最近 5 条构建记录 ----"
                 tail -5 "$JENKINS_HOME/releases/builds.log"
                 echo "---- 最近 5 个可用版本 ----"
-                tail -5 "$JENKINS_HOME/releases/tags.txt"
+                head -5 "$JENKINS_HOME/releases/tags.txt"
                 '''
             }
         }
