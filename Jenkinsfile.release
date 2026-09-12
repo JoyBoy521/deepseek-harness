@@ -68,9 +68,13 @@ pipeline {
                                                   passwordVariable: 'HARBOR_PASS')]) {
                     sh '''
                     echo "$HARBOR_PASS" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin
-                    docker manifest inspect "$IMAGE:$IMAGE_TAG" >/dev/null 2>&1 \
-                      || { echo "❌ Harbor 里没有这个版本: $IMAGE:$IMAGE_TAG"; exit 1; }
-                    echo "✅ 版本存在，可以发布"
+                    # 用 docker pull 校验版本（daemon 侧操作，可靠）
+                    # 不用 docker manifest inspect：它对 http 仓库行为不可靠，会误报"版本不存在"
+                    if ! docker pull "$IMAGE:$IMAGE_TAG"; then
+                      echo "❌ 拉取失败：Harbor 里没有这个版本，或没有拉取权限 -> $IMAGE:$IMAGE_TAG"
+                      exit 1
+                    fi
+                    echo "✅ 版本存在且已拉到本地"
                     '''
                 }
             }
