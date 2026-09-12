@@ -2,39 +2,19 @@ pipeline {
     agent any
 
     options {
+        // 发布是有风险的动作：同一时间只允许一个，避免互相回滚/覆盖
         disableConcurrentBuilds()
-        timeout(time: 60, unit: 'MINUTES')
+        timeout(time: 15, unit: 'MINUTES')
         buildDiscarder(logRotator(numToKeepStr: '50'))
     }
 
     parameters {
-        // 版本清单由 CI 线产出（写入 $JENKINS_HOME/releases/tags.txt），这里只负责读取。
-        // 脚本在 Jenkins 控制器（容器）里执行，所以用容器内路径。
-        // 首次使用可能需要：系统管理 → In-process Script Approval → 批准
-        activeChoice(
-            name: 'IMAGE_TAG',
-            choiceType: 'PT_SINGLE_SELECT',
-            description: '选择要发布的版本（清单由 CI 构建产出，最新的在最上面）',
-            script: [
-                $class: 'GroovyScript',
-                fallbackScript: [
-                    classpath: [],
-                    sandbox: true,
-                    script: 'return ["<读不到版本清单，请先跑一次 CI 线>"]'
-                ],
-                script: [
-                    classpath: [],
-                    sandbox: true,
-                    script: '''
-                        def f = new File("/var/jenkins_home/releases/tags.txt")
-                        if (!f.exists()) {
-                            return ["<还没有任何构建版本，请先跑 CI 线>"]
-                        }
-                        return f.readLines()
-                    '''
-                ]
-            ]
-        )
+        // 用 Git Parameter 直接列仓库里的 Tag —— 官方插件、无需脚本审批、无需凭据
+        // 镜像 tag 与 Git tag 一一对应，所以选 Git tag 就等于选镜像版本
+        gitParameter(name: 'GIT_TAG', type: 'PT_TAG', defaultValue: '',
+                     tagFilter: 'v(.*)',
+                     sortMode: 'DESCENDING_SMART',
+                     description: '选择要发布的 Git 标签（镜像 tag 与之一一对应）')
         choice(name: 'TARGET_ENV', choices: ['staging', 'prod'], description: '发布到哪个环境')
     }
 
@@ -48,16 +28,24 @@ pipeline {
         stage('参数校验与环境推导') {
             steps {
                 script {
-                    if (!params.IMAGE_TAG?.trim() || params.IMAGE_TAG.startsWith('<')) {
-                        error('❌ 必须选择一个有效的 IMAGE_TAG！（看参数下拉列表，或确认 Harbor 里已有版本）')
+                    if (!params.GIT_TAG?.trim()) {
+                        error('❌ 必须选择 GIT_TAG（要发布哪个 Git 标签，见下拉列表）')
                     }
+                    // 约定：镜像 tag == Git tag
+                    env.IMAGE_TAG  = params.GIT_TAG
                     env.TARGET_ENV = params.TARGET_ENV
-                    env.IMAGE_TAG  = params.IMAGE_TAG
                     env.CONTAINER  = "deepseek-harness-${params.TARGET_ENV}"
                     env.PORT       = (params.TARGET_ENV == 'prod') ? '8084' : '8083'
                     env.APP_ENV    = params.TARGET_ENV
-                    echo "环境 = ${env.APP_ENV} | 容器 = ${env.CONTAINER} | 端口 = ${env.PORT} | 镜像版本 = ${env.IMAGE_TAG}"
+                    echo "环境 = ${env.APP_ENV} | 容器 = ${env.CONTAINER} | 端口 = ${env.PORT} | 版本 = ${env.IMAGE_TAG}"
                 }
+            }
+        }
+
+        stage('生产发布审批') {
+            when { expression { params.TARGET_ENV == 'prod' } }
+            steps {
+                input message: "确认将 ${params.GIT_TAG} 发布到【生产环境 prod / 8084】？", ok: '批准发布'
             }
         }
 
@@ -68,10 +56,10 @@ pipeline {
                                                   passwordVariable: 'HARBOR_PASS')]) {
                     sh '''
                     echo "$HARBOR_PASS" | docker login "$REGISTRY" -u "$HARBOR_USER" --password-stdin
-                    # 用 docker pull 校验版本（daemon 侧操作，可靠）
-                    # 不用 docker manifest inspect：它对 http 仓库行为不可靠，会误报"版本不存在"
+                    # 用 docker pull 校验（daemon 侧操作，可靠）；manifest inspect 对 http 仓库会误报
                     if ! docker pull "$IMAGE:$IMAGE_TAG"; then
                       echo "❌ 拉取失败：Harbor 里没有这个版本，或没有拉取权限 -> $IMAGE:$IMAGE_TAG"
+                      echo "   提示：请确认该 Git tag 已经跑过 CI 线并成功推送到 Harbor"
                       exit 1
                     fi
                     echo "✅ 版本存在且已拉到本地"
@@ -95,7 +83,6 @@ pipeline {
             steps {
                 withCredentials([string(credentialsId: 'deepseek-api-key', variable: 'API_KEY')]) {
                     sh '''
-                    docker pull "$IMAGE:$IMAGE_TAG"
                     docker stop "$CONTAINER" || true
                     docker rm "$CONTAINER" || true
                     docker run -d --name "$CONTAINER" --restart unless-stopped -p "${PORT}:8082" \
@@ -103,6 +90,7 @@ pipeline {
                       -e DEEPSEEK_API_KEY="$API_KEY" \
                       -e DEEPSEEK_BASE_URL="https://api.deepseek.com" \
                       -e APP_ENV="$APP_ENV" \
+                      -e APP_VERSION="$IMAGE_TAG" \
                       "$IMAGE:$IMAGE_TAG"
                     '''
                 }
@@ -146,10 +134,9 @@ pipeline {
               sleep 5
             done
             echo "✅ 发布成功: $TARGET_ENV <- $IMAGE_TAG"
+            echo "版本来源: Git tag $IMAGE_TAG（与镜像 tag 一一对应）"
             if [ -n "$TOKEN" ]; then
               echo "访问地址: http://192.168.187.128:${PORT}/?token=$TOKEN"
-            else
-              echo "⚠️ 暂未取到 token，稍后手动执行: docker logs $CONTAINER | grep token"
             fi
             '''
         }
@@ -177,12 +164,16 @@ pipeline {
                   -e DEEPSEEK_API_KEY="$API_KEY" \
                   -e DEEPSEEK_BASE_URL="https://api.deepseek.com" \
                   -e APP_ENV="$APP_ENV" \
+                  -e APP_VERSION="$PREV" \
                   "$IMAGE:$PREV"
 
                 echo "等待回滚后的容器就绪…"
                 for i in $(seq 1 30); do
                   if docker exec "$CONTAINER" node -e "fetch('http://127.0.0.1:8082').then(r=>process.exit(r.status>=500?1:0)).catch(()=>process.exit(1))" 2>/dev/null; then
                     echo "✅ 已自动回滚到 $PREV，服务已恢复"
+                    printf "%s | ROLLBACK | %s | %s -> %s | build#%s\n" \
+                      "$(date '+%F %T')" "$TARGET_ENV" "$IMAGE_TAG" "$PREV" "$BUILD_NUMBER" \
+                      >> "$JENKINS_HOME/releases/deployments.log"
                     exit 0
                   fi
                   sleep 5

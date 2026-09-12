@@ -8,8 +8,14 @@ pipeline {
     }
 
     parameters {
+        // 正式发布：选一个 Git Tag（镜像 tag 与之一一对应）
+        gitParameter(name: 'GIT_TAG', type: 'PT_TAG', defaultValue: '',
+                     tagFilter: 'v(.*)',
+                     sortMode: 'DESCENDING_SMART',
+                     description: '选择要构建的 Git 标签（正式发布用；留空 = 用分支最新提交）')
+        // 日常开发：选分支
         gitParameter(name: 'GIT_BRANCH', type: 'PT_BRANCH', branchFilter: 'origin/(.*)',
-                     defaultValue: 'master', description: '选择要构建的分支')
+                     defaultValue: 'master', description: '分支（未选 Tag 时使用）')
         booleanParam(name: 'DEPLOY_DEV', defaultValue: true, description: '构建后部署到 dev 环境')
         booleanParam(name: 'CLEAN_IMAGES', defaultValue: false, description: '清理本地旧镜像')
     }
@@ -24,19 +30,16 @@ pipeline {
     }
 
     stages {
-        stage('参数回显') {
-            steps {
-                echo "分支 = ${params.GIT_BRANCH ?: 'master'} | 部署dev = ${params.DEPLOY_DEV} | 清理镜像 = ${params.CLEAN_IMAGES}"
-            }
-        }
-
         stage('拉取项目') {
             steps {
                 script {
-                    env.GIT_REF = params.GIT_BRANCH ?: 'master'
+                    // 选了 Tag 就检出 tag（refs/tags/xxx），否则检出分支（*/xxx）
+                    env.GIT_REF = params.GIT_TAG ? "refs/tags/${params.GIT_TAG}"
+                                                 : "*/${params.GIT_BRANCH ?: 'master'}"
+                    echo "本次检出: ${env.GIT_REF}"
                 }
                 checkout([$class: 'GitSCM',
-                    branches: [[name: "*/${env.GIT_REF}"]],
+                    branches: [[name: "${env.GIT_REF}"]],
                     userRemoteConfigs: [[url: 'https://github.com/JoyBoy521/deepseek-harness.git']]])
             }
         }
@@ -44,18 +47,26 @@ pipeline {
         stage('生成镜像标签') {
             steps {
                 script {
-                    def date = sh(script: 'date +%Y%m%d', returnStdout: true).trim()
-                    def sha  = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-                    env.TAG = "${date}u${env.BUILD_NUMBER}-${sha}"
+                    def sha = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
                     env.GIT_SHA = sha
-                    echo "分支 = ${env.GIT_REF}，提交 = ${sha}，镜像标签 = ${env.TAG}"
+                    if (params.GIT_TAG) {
+                        // 正式发布：镜像 tag == Git tag（一一对应，可追溯、可回滚）
+                        env.TAG = params.GIT_TAG
+                        env.IS_RELEASE = 'true'
+                    } else {
+                        // 日常开发构建：日期 + 构建号 + 短哈希
+                        def date = sh(script: 'date +%Y%m%d', returnStdout: true).trim()
+                        env.TAG = "${date}u${env.BUILD_NUMBER}-${sha}"
+                        env.IS_RELEASE = 'false'
+                    }
+                    echo "镜像标签 = ${env.TAG}（正式发布: ${env.IS_RELEASE}），提交 = ${sha}"
                 }
             }
         }
 
         stage('打包镜像') {
             steps {
-                sh 'docker build -t "$IMAGE:$TAG" .'
+                sh 'docker build --build-arg GIT_COMMIT="$GIT_SHA" -t "$IMAGE:$TAG" .'
             }
         }
 
@@ -96,7 +107,6 @@ pipeline {
             when { expression { params.DEPLOY_DEV == true } }
             steps {
                 sh '''
-                # 严格健康检查：HTTP 5xx（nginx 502 = 后端还没起来）不算通过
                 for i in $(seq 1 40); do
                   if docker exec "$CONTAINER" node -e "fetch('http://127.0.0.1:8082').then(r=>process.exit(r.status>=500?1:0)).catch(()=>process.exit(1))" 2>/dev/null; then
                     echo "✅ dev 健康检查通过"; exit 0
@@ -109,15 +119,26 @@ pipeline {
             }
         }
 
+        // 正式发布（打了 Git Tag）→ 自动晋级到 staging，由 CD 线负责部署
+        stage('晋级到 staging') {
+            when { expression { env.IS_RELEASE == 'true' } }
+            steps {
+                build job: 'deepseek-harness-cd', wait: false,
+                      parameters: [
+                        string(name: 'GIT_TAG', value: env.TAG),
+                        string(name: 'TARGET_ENV', value: 'staging')
+                      ]
+                echo "已触发 CD 线部署 staging（版本 ${env.TAG}）"
+            }
+        }
+
         stage('记录构建台账') {
             steps {
                 sh '''
                 mkdir -p "$JENKINS_HOME/releases"
-                printf "%s | CI | %s | %s | %s | %s | %s\n" \
-                  "$(date '+%F %T')" "$APP_ENV" "$TAG" "$GIT_REF" "$GIT_SHA" "$BUILD_NUMBER" \
+                printf "%s | CI | %s | %s | %s | %s | %s | release=%s\n" \
+                  "$(date '+%F %T')" "$APP_ENV" "$TAG" "$GIT_REF" "$GIT_SHA" "$BUILD_NUMBER" "$IS_RELEASE" \
                   >> "$JENKINS_HOME/releases/builds.log"
-                # 版本清单：最新的写在最前面，最多保留 50 条
-                # （CD 参数页直接 readLines() 读取，所以这里必须保持"最新在前"的顺序）
                 {
                   echo "$TAG"
                   cat "$JENKINS_HOME/releases/tags.txt" 2>/dev/null
@@ -125,8 +146,6 @@ pipeline {
                   && mv "$JENKINS_HOME/releases/tags.txt.new" "$JENKINS_HOME/releases/tags.txt"
                 echo "---- 最近 5 条构建记录 ----"
                 tail -5 "$JENKINS_HOME/releases/builds.log"
-                echo "---- 最近 5 个可用版本 ----"
-                head -5 "$JENKINS_HOME/releases/tags.txt"
                 '''
             }
         }
@@ -135,7 +154,6 @@ pipeline {
             when { expression { params.CLEAN_IMAGES == true } }
             steps {
                 sh '''
-                docker image prune -f
                 # 按创建时间倒序，只留最近 5 个（完整版本都在 Harbor 里）
                 docker images "$IMAGE" --format "{{.CreatedAt}}\t{{.Tag}}" | sort -r | tail -n +6 \
                   | awk '{print $NF}' | xargs -I {} docker rmi "$IMAGE:{}" || true
@@ -152,13 +170,11 @@ pipeline {
               if [ -n "$TOKEN" ]; then break; fi
               sleep 5
             done
-            echo "✅ CI 完成"
+            echo "✅ CI 完成（正式发布: $IS_RELEASE）"
             echo "镜像已入库: $IMAGE:$TAG"
             echo "源码: $GIT_REF @ $GIT_SHA"
             if [ -n "$TOKEN" ]; then
               echo "dev 访问: http://192.168.187.128:8082/?token=$TOKEN"
-            else
-              echo "⚠️ 暂未取到 token，稍后手动执行: docker logs $CONTAINER | grep token"
             fi
             '''
         }
